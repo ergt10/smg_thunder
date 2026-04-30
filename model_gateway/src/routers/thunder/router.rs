@@ -1,4 +1,4 @@
-//! `ThunderRouter` — program-aware proxy. Phase 3: non-streaming chat passthrough.
+//! `ThunderRouter` — program-aware proxy. Phase 4: chat passthrough.
 //!
 //! Currently selects the first configured worker URL on every request (no load balancing,
 //! no program tracking, no scheduling). Real backend selection arrives in Phase 6+.
@@ -6,15 +6,15 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::HeaderMap;
+use axum::response::Response;
 use openai_protocol::chat::ChatCompletionRequest;
 
 use crate::app_context::AppContext;
 use crate::middleware::TenantRequestMeta;
 use crate::routers::error;
 
-use super::proxy::forward_non_streaming_chat;
+use super::proxy::{forward_non_streaming_chat, forward_streaming_chat};
 
 pub struct ThunderRouter {
     /// Worker URLs from `RoutingMode::Thunder { worker_urls }`. Phase 3 picks the first one
@@ -80,21 +80,16 @@ impl crate::routers::RouterTrait for ThunderRouter {
         body: &ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
-        // Streaming branch lands in Phase 4.
-        if body.stream {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "Thunder streaming chat completions not implemented yet (Phase 4)",
-            )
-                .into_response();
-        }
-
         let Some(worker_url) = self.select_worker_url() else {
             return error::service_unavailable(
                 "no_workers",
                 "Thunder mode has no worker URLs configured",
             );
         };
+
+        if body.stream {
+            return forward_streaming_chat(&self.client, worker_url, body).await;
+        }
 
         forward_non_streaming_chat(&self.client, worker_url, body).await
     }

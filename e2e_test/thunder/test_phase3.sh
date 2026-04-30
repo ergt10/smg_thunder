@@ -84,15 +84,5 @@ if ! echo "$MOCK_STATE" | grep -q '"request_count": 1'; then
     exit 1
 fi
 
-echo "== streaming request returns 501 (Phase 4 not yet done) =="
-STREAM_CODE=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
-    -X POST "http://localhost:$SMG_PORT/v1/chat/completions" \
-    -H 'content-type: application/json' \
-    -d '{"model":"mock","stream":true,"messages":[{"role":"user","content":"ping"}]}')
-if [[ "$STREAM_CODE" != "501" ]]; then
-    echo "FAIL: expected streaming to return 501 in Phase 3, got $STREAM_CODE"
-    exit 1
-fi
-
 echo
 echo "PASS: Phase 3 e2e complete"

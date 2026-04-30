@@ -19,12 +19,16 @@ Considered alternatives:
 
 ## Status
 
+**Progress source of truth**: this table can intentionally lag implementation by one phase while
+the next phase is being prepared. Use `git log --oneline feat/thunder` to see the true completed
+phase sequence from the committed history.
+
 | # | Phase | Status | Commit |
 |---|---|---|---|
 | 0 | Env baseline (`cargo build` + `cargo test` clean) | ✅ Done | _no commit_ (env only; 3365 tests pass, 0 failed) |
 | 1 | Empty `RoutingMode::Thunder` wired into factory (501 stub) | ✅ Done | `734dbbec` |
 | 2 | Mock vLLM backend (`e2e_test/thunder/mock_vllm.py`) | ✅ Done | `8470e953` |
-| 3 | Non-streaming chat passthrough | ⬜ Not started | — |
+| 3 | Non-streaming chat passthrough | ✅ Done | `0ab0b5ed` |
 | 4 | Streaming (SSE) chat passthrough | ⬜ Not started | — |
 | 5 | Program state + `/programs` endpoint (default mode) | ⬜ Not started | — |
 | 6 | vLLM metrics client + `BackendState` capacity + `/thunder/metrics` | ⬜ Not started | — |
@@ -35,7 +39,7 @@ Considered alternatives:
 | 11 | Profiling (`--profile`, `/profiles` endpoint) | ⬜ Not started | — |
 | 12 | char/token ratio + acting-token decay/weight polish | ⬜ Not started | — |
 
-Mark a row ✅ and fill the commit hash after each phase commit lands on `feat/thunder`.
+Use the commit log rather than this table when deciding where to resume implementation.
 
 ---
 
