@@ -504,6 +504,11 @@ impl JobQueue {
                         )
                         .await;
                     }
+                    RoutingMode::Thunder { .. } => {
+                        // Thunder manages its upstream backends inside ThunderRouter; no
+                        // smg-level Worker registration required.
+                        return Ok("Thunder mode: no workers registered".to_string());
+                    }
                 };
 
                 debug!(

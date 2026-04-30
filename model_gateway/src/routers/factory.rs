@@ -39,6 +39,7 @@ pub mod router_ids {
     pub const HTTP_OPENAI: RouterId = RouterId::new("http-openai");
     pub const HTTP_ANTHROPIC: RouterId = RouterId::new("http-anthropic");
     pub const HTTP_GEMINI: RouterId = RouterId::new("http-gemini");
+    pub const HTTP_THUNDER: RouterId = RouterId::new("http-thunder");
     pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
     pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
 }
@@ -71,6 +72,9 @@ impl RouterFactory {
                 RoutingMode::Gemini { .. } => {
                     Err("Gemini mode requires HTTP connection_mode".to_string())
                 }
+                RoutingMode::Thunder { .. } => {
+                    Err("Thunder mode requires HTTP connection_mode".to_string())
+                }
             },
             ConnectionMode::Http => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,
@@ -90,6 +94,7 @@ impl RouterFactory {
                 RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
                 RoutingMode::Anthropic { .. } => Self::create_anthropic_router(ctx).await,
                 RoutingMode::Gemini { .. } => Self::create_gemini_router(ctx).await,
+                RoutingMode::Thunder { .. } => Self::create_thunder_router(ctx).await,
             },
         }
     }
@@ -198,6 +203,15 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let router = GeminiRouter::new(ctx.clone())?;
+        Ok(Box::new(router))
+    }
+
+    /// Create a Thunder router — program-aware proxy with capacity-based pause/resume scheduling.
+    /// Phase 1: stub returning 501 for all endpoints; real chat passthrough lands in Phase 3.
+    pub async fn create_thunder_router(
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let router = super::thunder::ThunderRouter::new(ctx).await?;
         Ok(Box::new(router))
     }
 

@@ -284,6 +284,10 @@ pub enum RoutingMode {
     Anthropic { worker_urls: Vec<String> },
     #[serde(rename = "gemini")]
     Gemini { worker_urls: Vec<String> },
+    /// Thunder mode — program-aware proxy with capacity-based pause/resume scheduling.
+    /// Phase 1 stub: just holds worker URLs; sub-mode and backend type flags arrive in later phases.
+    #[serde(rename = "thunder")]
+    Thunder { worker_urls: Vec<String> },
 }
 
 impl RoutingMode {
@@ -302,6 +306,7 @@ impl RoutingMode {
             RoutingMode::OpenAI { worker_urls } => worker_urls.len(),
             RoutingMode::Anthropic { worker_urls } => worker_urls.len(),
             RoutingMode::Gemini { worker_urls } => worker_urls.len(),
+            RoutingMode::Thunder { worker_urls } => worker_urls.len(),
         }
     }
 
@@ -705,6 +710,7 @@ impl RouterConfig {
             RoutingMode::OpenAI { .. } => "openai",
             RoutingMode::Anthropic { .. } => "anthropic",
             RoutingMode::Gemini { .. } => "gemini",
+            RoutingMode::Thunder { .. } => "thunder",
         }
     }
 

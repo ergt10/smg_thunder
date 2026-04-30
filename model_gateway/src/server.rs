@@ -132,6 +132,9 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
             RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
             RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+            // Thunder manages backends inside the router itself rather than the worker registry,
+            // so readiness depends on whether worker URLs were configured, not registry health.
+            RoutingMode::Thunder { worker_urls } => !worker_urls.is_empty(),
         }
     };
 

@@ -349,6 +349,12 @@ impl ConfigValidator {
                     Self::validate_urls(worker_urls)?;
                 }
             }
+            RoutingMode::Thunder { worker_urls } => {
+                // Same lenient policy as OpenAI/Anthropic/Gemini — URLs validated when present.
+                if !worker_urls.is_empty() {
+                    Self::validate_urls(worker_urls)?;
+                }
+            }
         }
         Ok(())
     }
@@ -591,6 +597,11 @@ impl ConfigValidator {
             RoutingMode::Gemini { .. } => {
                 return Err(ConfigError::ValidationFailed {
                     reason: "Gemini mode does not support service discovery".to_string(),
+                });
+            }
+            RoutingMode::Thunder { .. } => {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Thunder mode does not support service discovery".to_string(),
                 });
             }
         }

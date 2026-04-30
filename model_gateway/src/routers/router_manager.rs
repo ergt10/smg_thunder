@@ -162,9 +162,12 @@ impl RouterManager {
             (ConnectionMode::Grpc, RoutingMode::Regular { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::PrefillDecode { .. }) => router_ids::GRPC_PD,
             (ConnectionMode::Http, RoutingMode::Gemini { .. }) => router_ids::HTTP_GEMINI,
+            (ConnectionMode::Http, RoutingMode::Thunder { .. }) => router_ids::HTTP_THUNDER,
             (ConnectionMode::Grpc, RoutingMode::OpenAI { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::Anthropic { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::Gemini { .. }) => router_ids::GRPC_REGULAR,
+            // Thunder doesn't support gRPC; the factory rejects this combo before it reaches us.
+            (ConnectionMode::Grpc, RoutingMode::Thunder { .. }) => router_ids::HTTP_THUNDER,
         }
     }
 
