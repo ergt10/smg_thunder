@@ -21,8 +21,8 @@ Considered alternatives:
 
 | # | Phase | Status | Commit |
 |---|---|---|---|
-| 0 | Env baseline (`cargo build` + `cargo test` clean) | ⬜ Not started | — |
-| 1 | Empty `RoutingMode::Thunder` wired into factory (501 stub) | ⬜ Not started | — |
+| 0 | Env baseline (`cargo build` + `cargo test` clean) | ✅ Done | _no commit_ (env only; 3365 tests pass, 0 failed) |
+| 1 | Empty `RoutingMode::Thunder` wired into factory (501 stub) | ✅ Done | `734dbbec` |
 | 2 | Mock vLLM backend (`e2e_test/mock_vllm.py`) | ⬜ Not started | — |
 | 3 | Non-streaming chat passthrough | ⬜ Not started | — |
 | 4 | Streaming (SSE) chat passthrough | ⬜ Not started | — |
