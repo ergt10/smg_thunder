@@ -31,7 +31,7 @@ phase sequence from the committed history.
 | 3 | Non-streaming chat passthrough | ✅ Done | `0ab0b5ed` |
 | 4 | Streaming (SSE) chat passthrough | ✅ Done | `3758e9f0` |
 | 5 | Program state + `/programs` endpoint (default mode) | ✅ Done | `f1ff9828` |
-| 6 | vLLM metrics client + `BackendState` capacity + `/thunder/metrics` | ✅ Done | _(this commit)_ |
+| 6 | vLLM metrics client + `BackendState` capacity + `/thunder/metrics` | ✅ Done | `7fa5709e` |
 | 7 | TR sub-mode capacity admission (503 on full, no pause yet) | ⬜ Not started | — |
 | 8 | Pause/Resume scheduler + BFD greedy resume + 30-min timeout | ⬜ Not started | — |
 | 9 | Streaming token progress callback (every 20 tokens) | ⬜ Not started | — |
