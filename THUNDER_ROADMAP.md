@@ -30,7 +30,7 @@ phase sequence from the committed history.
 | 2 | Mock vLLM backend (`e2e_test/thunder/mock_vllm.py`) | ✅ Done | `8470e953` |
 | 3 | Non-streaming chat passthrough | ✅ Done | `0ab0b5ed` |
 | 4 | Streaming (SSE) chat passthrough | ✅ Done | `3758e9f0` |
-| 5 | Program state + `/programs` endpoint (default mode) | ✅ Done | _(this commit)_ |
+| 5 | Program state + `/programs` endpoint (default mode) | ✅ Done | `f1ff9828` |
 | 6 | vLLM metrics client + `BackendState` capacity + `/thunder/metrics` | ⬜ Not started | — |
 | 7 | TR sub-mode capacity admission (503 on full, no pause yet) | ⬜ Not started | — |
 | 8 | Pause/Resume scheduler + BFD greedy resume + 30-min timeout | ⬜ Not started | — |
