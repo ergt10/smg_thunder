@@ -23,7 +23,10 @@ use crate::routers::error;
 use super::backend::{BackendState, BUFFER_PER_PROGRAM};
 use super::metrics::{MetricsClient, VllmMetricsClient};
 use super::program::{snapshot_programs, Program, ProgramRegistry};
-use super::proxy::{forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback};
+use super::proxy::{
+    forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback,
+    StreamingProgressCallback,
+};
 use super::scheduler::{wait_for_resume_or_force, SchedulerState};
 
 /// Interval for the per-backend metrics polling loop. Kept tight enough for e2e tests to observe
@@ -244,6 +247,12 @@ impl ThunderRouter {
             program.after_request(total_tokens);
         }
     }
+
+    fn update_streaming_tokens(programs: &ProgramRegistry, program_id: &str, delta_tokens: u64) {
+        if let Some(mut program) = programs.get_mut(program_id) {
+            program.update_streaming_tokens(delta_tokens);
+        }
+    }
 }
 
 fn spawn_metrics_poller(metrics: Arc<VllmMetricsClient>) {
@@ -352,10 +361,26 @@ impl crate::routers::RouterTrait for ThunderRouter {
 
         if body.stream {
             let programs = Arc::clone(&self.programs);
+            let progress_programs = Arc::clone(&self.programs);
+            let progress_program_id = program_id.clone();
             let on_finish: StreamingFinishCallback = Box::new(move |total_tokens| {
                 Self::complete_program(&programs, &program_id, total_tokens);
             });
-            return forward_streaming_chat(&self.client, &backend_url, body, Some(on_finish)).await;
+            let on_progress: StreamingProgressCallback = Box::new(move |delta_tokens| {
+                Self::update_streaming_tokens(
+                    &progress_programs,
+                    &progress_program_id,
+                    delta_tokens,
+                );
+            });
+            return forward_streaming_chat(
+                &self.client,
+                &backend_url,
+                body,
+                Some(on_finish),
+                Some(on_progress),
+            )
+            .await;
         }
 
         let forwarded = forward_non_streaming_chat(&self.client, &backend_url, body).await;

@@ -16,6 +16,7 @@ use crate::routers::common::header_utils;
 use crate::routers::error;
 
 pub(super) type StreamingFinishCallback = Box<dyn FnOnce(Option<u64>) + Send + 'static>;
+pub(super) type StreamingProgressCallback = Box<dyn FnMut(u64) + Send + 'static>;
 
 pub(super) struct ForwardedChatResponse {
     pub response: Response,
@@ -73,16 +74,24 @@ struct StreamingProgramFinisher {
     inner: UpstreamByteStream,
     sse_buffer: String,
     total_tokens: Option<u64>,
+    pending_progress_tokens: u64,
     on_finish: Option<StreamingFinishCallback>,
+    on_progress: Option<StreamingProgressCallback>,
 }
 
 impl StreamingProgramFinisher {
-    fn new(inner: UpstreamByteStream, on_finish: Option<StreamingFinishCallback>) -> Self {
+    fn new(
+        inner: UpstreamByteStream,
+        on_finish: Option<StreamingFinishCallback>,
+        on_progress: Option<StreamingProgressCallback>,
+    ) -> Self {
         Self {
             inner,
             sse_buffer: String::new(),
             total_tokens: None,
+            pending_progress_tokens: 0,
             on_finish,
+            on_progress,
         }
     }
 
@@ -103,11 +112,45 @@ impl StreamingProgramFinisher {
                 if let Some(total_tokens) = extract_total_tokens(&payload) {
                     self.total_tokens = Some(total_tokens);
                 }
+                for choice in payload
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(content) = choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("content"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    self.observe_content_delta(content);
+                }
             }
         }
     }
 
+    fn observe_content_delta(&mut self, content: &str) {
+        let estimated_tokens = (content.chars().count() as u64).div_ceil(4).max(1);
+        self.pending_progress_tokens = self
+            .pending_progress_tokens
+            .saturating_add(estimated_tokens);
+        while self.pending_progress_tokens >= 20 {
+            if let Some(on_progress) = self.on_progress.as_mut() {
+                on_progress(20);
+            }
+            self.pending_progress_tokens -= 20;
+        }
+    }
+
     fn finish(&mut self) {
+        if self.total_tokens.is_none() && self.pending_progress_tokens > 0 {
+            if let Some(on_progress) = self.on_progress.as_mut() {
+                on_progress(self.pending_progress_tokens);
+            }
+            self.pending_progress_tokens = 0;
+        }
         if let Some(on_finish) = self.on_finish.take() {
             on_finish(self.total_tokens);
         }
@@ -197,6 +240,7 @@ pub(super) async fn forward_streaming_chat(
     worker_url: &str,
     body: &ChatCompletionRequest,
     mut on_finish: Option<StreamingFinishCallback>,
+    on_progress: Option<StreamingProgressCallback>,
 ) -> Response {
     let url = chat_completions_url(worker_url);
 
@@ -240,7 +284,7 @@ pub(super) async fn forward_streaming_chat(
         .or_insert(HeaderValue::from_static("text/event-stream"));
 
     let upstream_stream = resp.bytes_stream().boxed();
-    let finisher = StreamingProgramFinisher::new(upstream_stream, on_finish);
+    let finisher = StreamingProgramFinisher::new(upstream_stream, on_finish, on_progress);
     let stream = stream::unfold(finisher, |mut finisher| async move {
         match finisher.inner.next().await {
             Some(Ok(bytes)) => {
