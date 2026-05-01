@@ -35,6 +35,11 @@ pub struct Program {
     pub context_len: usize,
     pub total_tokens: u64,
     pub step_count: u64,
+    /// Backend URL this program is currently bound to (set when the router admits the request
+    /// in Phase 6+). `None` until first request is dispatched, after which it persists across
+    /// retries — Python pins programs to one backend for prefix-cache locality.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_url: Option<String>,
 }
 
 impl Program {
@@ -46,14 +51,18 @@ impl Program {
             context_len: 0,
             total_tokens: 0,
             step_count: 0,
+            backend_url: None,
         }
     }
 
-    pub fn before_request(&mut self, context_len: usize) {
+    pub fn before_request(&mut self, context_len: usize, backend_url: &str) {
         self.step_count += 1;
         self.context_len = context_len;
         self.status = ProgramStatus::Reasoning;
         self.state = ProgramState::Active;
+        if self.backend_url.is_none() {
+            self.backend_url = Some(backend_url.to_owned());
+        }
     }
 
     pub fn after_request(&mut self, total_tokens: Option<u64>) {
@@ -71,6 +80,8 @@ pub struct ProgramSnapshot {
     pub step_count: u64,
     pub status: ProgramStatus,
     pub state: ProgramState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_url: Option<String>,
 }
 
 impl From<&Program> for ProgramSnapshot {
@@ -81,6 +92,7 @@ impl From<&Program> for ProgramSnapshot {
             step_count: program.step_count,
             status: program.status,
             state: program.state,
+            backend_url: program.backend_url.clone(),
         }
     }
 }

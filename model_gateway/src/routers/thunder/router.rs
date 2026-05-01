@@ -1,10 +1,12 @@
-//! `ThunderRouter` — program-aware proxy. Phase 5: default-mode program tracking.
+//! `ThunderRouter` — program-aware proxy. Phase 6: per-backend metrics + capacity tracking.
 //!
-//! Currently selects the first configured worker URL on every request (no load balancing and no
-//! scheduling). Capacity-aware backend state arrives in Phase 6+.
+//! Phase 3-5 only used a flat list of worker URLs. Phase 6 introduces `BackendState` per worker
+//! and spawns one background task per backend that polls vLLM's `/get_server_info` to refresh
+//! the cache config. Programs are now pinned to a backend on first dispatch (Python parity).
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -12,19 +14,25 @@ use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use openai_protocol::chat::ChatCompletionRequest;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::app_context::AppContext;
 use crate::middleware::TenantRequestMeta;
 use crate::routers::error;
 
+use super::backend::BackendState;
+use super::metrics::{MetricsClient, VllmMetricsClient};
 use super::program::{snapshot_programs, Program, ProgramRegistry};
 use super::proxy::{forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback};
 
+/// Interval for the per-backend metrics polling loop. Kept tight enough for e2e tests to observe
+/// dynamic capacity changes within a few seconds.
+const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
 pub struct ThunderRouter {
-    /// Worker URLs from `RoutingMode::Thunder { worker_urls }`. Phase 3 picks the first one
-    /// for every request; Phase 6+ replaces this with capacity-aware selection.
-    worker_urls: Vec<String>,
+    /// Per-backend state (one entry per `--worker-urls`). Phase 6+ replaces ad-hoc worker URL
+    /// lookups with capacity-aware backend selection.
+    backends: Vec<Arc<BackendState>>,
     /// Shared HTTP client (cloned from AppContext); reqwest::Client is internally Arc'd, so
     /// cloning is cheap and connection pooling is shared with the rest of smg.
     client: reqwest::Client,
@@ -34,7 +42,14 @@ pub struct ThunderRouter {
 impl std::fmt::Debug for ThunderRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThunderRouter")
-            .field("worker_urls", &self.worker_urls)
+            .field(
+                "backends",
+                &self
+                    .backends
+                    .iter()
+                    .map(|b| b.url())
+                    .collect::<Vec<_>>(),
+            )
             .field("programs", &self.programs.len())
             .finish()
     }
@@ -51,32 +66,45 @@ impl ThunderRouter {
                 ))
             }
         };
+
+        let client = ctx.client.clone();
+        let mut backends = Vec::with_capacity(worker_urls.len());
+        for url in &worker_urls {
+            let metrics = Arc::new(VllmMetricsClient::new(url.clone(), client.clone()));
+            // Best-effort: try to fetch the cache config once before serving. If the upstream
+            // is not yet up the periodic poller will retry every second.
+            let _ = metrics.fetch_cache_config().await;
+            let backend = Arc::new(BackendState::new(url.clone(), metrics.clone()));
+            spawn_metrics_poller(metrics);
+            backends.push(backend);
+        }
+
         Ok(Self {
-            worker_urls,
-            client: ctx.client.clone(),
+            backends,
+            client,
             programs: Arc::new(dashmap::DashMap::new()),
         })
     }
 
-    pub fn worker_urls(&self) -> &[String] {
-        &self.worker_urls
+    pub fn worker_urls(&self) -> Vec<String> {
+        self.backends.iter().map(|b| b.url().to_string()).collect()
     }
 
-    /// Pick the upstream worker for this request.
+    /// Pick the upstream backend for this request.
     ///
-    /// Phase 3: always the first configured URL. Replaced by capacity-aware selection in
-    /// Phase 6 (`BackendState`) and pause/resume scheduling in Phase 8.
-    fn select_worker_url(&self) -> Option<&str> {
-        self.worker_urls.first().map(String::as_str)
+    /// Phase 6: still always the first configured backend. Capacity-aware admission lands in
+    /// Phase 7; pause/resume scheduling in Phase 8.
+    fn select_backend(&self) -> Option<&Arc<BackendState>> {
+        self.backends.first()
     }
 
-    fn prepare_program(&self, program_id: &str, body: &ChatCompletionRequest) {
+    fn prepare_program(&self, program_id: &str, body: &ChatCompletionRequest, backend_url: &str) {
         let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
         let mut program = self
             .programs
             .entry(program_id.to_owned())
             .or_insert_with(|| Program::new(program_id));
-        program.before_request(context_len);
+        program.before_request(context_len, backend_url);
     }
 
     fn complete_program(programs: &ProgramRegistry, program_id: &str, total_tokens: Option<u64>) {
@@ -84,6 +112,20 @@ impl ThunderRouter {
             program.after_request(total_tokens);
         }
     }
+
+}
+
+fn spawn_metrics_poller(metrics: Arc<VllmMetricsClient>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(METRICS_POLL_INTERVAL);
+        // First tick fires immediately; we already did one fetch above, so skip it to avoid
+        // double-polling at startup.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = metrics.fetch_cache_config().await;
+        }
+    });
 }
 
 fn program_id_from_request(body: &ChatCompletionRequest) -> String {
@@ -118,13 +160,37 @@ impl crate::routers::RouterTrait for ThunderRouter {
 
     fn extra_routes(&self) -> Router<Arc<crate::server::AppState>> {
         let programs = Arc::clone(&self.programs);
-        Router::new().route(
-            "/programs",
-            get(move || {
-                let programs = Arc::clone(&programs);
-                async move { Json(snapshot_programs(&programs)) }
-            }),
-        )
+        let backends = self.backends.clone();
+        Router::new()
+            .route(
+                "/programs",
+                get({
+                    let programs = Arc::clone(&programs);
+                    move || {
+                        let programs = Arc::clone(&programs);
+                        async move { Json(snapshot_programs(&programs)) }
+                    }
+                }),
+            )
+            .route(
+                "/thunder/metrics",
+                get({
+                    let programs = Arc::clone(&programs);
+                    let backends = backends.clone();
+                    move || {
+                        let programs = Arc::clone(&programs);
+                        let backends = backends.clone();
+                        async move {
+                            let snapshot: Vec<_> =
+                                backends.iter().map(|b| b.snapshot(&programs)).collect();
+                            Json(json!({
+                                "program_count": programs.len(),
+                                "backends": snapshot,
+                            }))
+                        }
+                    }
+                }),
+            )
     }
 
     async fn route_chat(
@@ -134,25 +200,28 @@ impl crate::routers::RouterTrait for ThunderRouter {
         body: &ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
-        let Some(worker_url) = self.select_worker_url() else {
+        let Some(backend) = self.select_backend() else {
             return error::service_unavailable(
                 "no_workers",
                 "Thunder mode has no worker URLs configured",
             );
         };
+        let backend_url = backend.url().to_string();
         let program_id = program_id_from_request(body);
-        self.prepare_program(&program_id, body);
+        self.prepare_program(&program_id, body, &backend_url);
 
         if body.stream {
             let programs = Arc::clone(&self.programs);
             let on_finish: StreamingFinishCallback = Box::new(move |total_tokens| {
                 Self::complete_program(&programs, &program_id, total_tokens);
             });
-            return forward_streaming_chat(&self.client, worker_url, body, Some(on_finish)).await;
+            return forward_streaming_chat(&self.client, &backend_url, body, Some(on_finish))
+                .await;
         }
 
-        let forwarded = forward_non_streaming_chat(&self.client, worker_url, body).await;
+        let forwarded = forward_non_streaming_chat(&self.client, &backend_url, body).await;
         Self::complete_program(&self.programs, &program_id, forwarded.total_tokens);
         forwarded.response
     }
 }
+
