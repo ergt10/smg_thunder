@@ -16,12 +16,12 @@ use openai_protocol::chat::ChatCompletionRequest;
 use serde_json::{json, Value};
 
 use crate::app_context::AppContext;
-use crate::config::ThunderSubMode;
+use crate::config::{ThunderBackendType, ThunderSubMode};
 use crate::middleware::TenantRequestMeta;
 use crate::routers::error;
 
 use super::backend::{BackendState, BUFFER_PER_PROGRAM};
-use super::metrics::{MetricsClient, VllmMetricsClient};
+use super::metrics::{MetricsClient, SglangMetricsClient, SkyrlMetricsClient, VllmMetricsClient};
 use super::program::{snapshot_programs, Program, ProgramRegistry};
 use super::proxy::{
     forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback,
@@ -58,11 +58,12 @@ impl std::fmt::Debug for ThunderRouter {
 
 impl ThunderRouter {
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        let (worker_urls, sub_mode) = match &ctx.router_config.mode {
+        let (worker_urls, sub_mode, backend_type) = match &ctx.router_config.mode {
             crate::config::RoutingMode::Thunder {
                 worker_urls,
                 sub_mode,
-            } => (worker_urls.clone(), *sub_mode),
+                backend_type,
+            } => (worker_urls.clone(), *sub_mode, *backend_type),
             other => {
                 return Err(format!(
                     "ThunderRouter::new called with non-Thunder mode: {:?}",
@@ -74,7 +75,17 @@ impl ThunderRouter {
         let client = ctx.client.clone();
         let mut backends = Vec::with_capacity(worker_urls.len());
         for url in &worker_urls {
-            let metrics = Arc::new(VllmMetricsClient::new(url.clone(), client.clone()));
+            let metrics: Arc<dyn MetricsClient> = match backend_type {
+                ThunderBackendType::Vllm => {
+                    Arc::new(VllmMetricsClient::new(url.clone(), client.clone()))
+                }
+                ThunderBackendType::Sglang => {
+                    Arc::new(SglangMetricsClient::new(url.clone(), client.clone()))
+                }
+                ThunderBackendType::Skyrl => {
+                    Arc::new(SkyrlMetricsClient::new(url.clone(), client.clone()))
+                }
+            };
             let _ = metrics.fetch_cache_config().await;
             let backend = Arc::new(BackendState::new(url.clone(), metrics.clone()));
             spawn_metrics_poller(metrics);
@@ -255,7 +266,7 @@ impl ThunderRouter {
     }
 }
 
-fn spawn_metrics_poller(metrics: Arc<VllmMetricsClient>) {
+fn spawn_metrics_poller(metrics: Arc<dyn MetricsClient>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(METRICS_POLL_INTERVAL);
         interval.tick().await; // skip first tick (initial fetch already done above)

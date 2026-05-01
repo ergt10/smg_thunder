@@ -2,14 +2,18 @@
 //!
 //! Phase 6 ports the Python `MetricsClient` abstraction (see
 //! `ThunderAgent/backend/metrics_base.py`). Phase 6 only ships the vLLM client; SGLang and
-//! SkyRL implementations land in Phase 10.
+//! Phase 10 adds SGLang and SkyRL client wrappers.
 
 use std::fmt::Debug;
 
 use serde::Serialize;
 
+pub mod sglang;
+pub mod skyrl;
 pub mod vllm;
 
+pub use sglang::SglangMetricsClient;
+pub use skyrl::SkyrlMetricsClient;
 pub use vllm::VllmMetricsClient;
 
 /// Static KV cache configuration reported by a backend (vLLM `cache_config` shape).

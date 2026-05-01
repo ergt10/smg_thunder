@@ -292,6 +292,9 @@ pub enum RoutingMode {
         /// pause/resume scheduling.  Defaults to `default` for backwards-compat config files.
         #[serde(default)]
         sub_mode: ThunderSubMode,
+        /// Backend metrics dialect used for cache-capacity polling.
+        #[serde(default)]
+        backend_type: ThunderBackendType,
     },
 }
 
@@ -308,6 +311,16 @@ pub enum ThunderSubMode {
     #[default]
     Default,
     Tr,
+}
+
+/// Backend metrics dialect for `RoutingMode::Thunder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThunderBackendType {
+    #[default]
+    Vllm,
+    Sglang,
+    Skyrl,
 }
 
 impl RoutingMode {

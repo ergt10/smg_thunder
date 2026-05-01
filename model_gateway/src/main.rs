@@ -7,7 +7,7 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
         PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        ThunderSubMode, TokenizerCacheConfig, TraceConfig,
+        ThunderBackendType, ThunderSubMode, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -487,6 +487,10 @@ struct CliArgs {
     /// Phase 8 introduces pause/resume.
     #[arg(long, default_value = "default", value_parser = ["default", "tr"], help_heading = "Thunder")]
     thunder_sub_mode: String,
+
+    /// Backend metrics dialect for --backend thunder.
+    #[arg(long, default_value = "vllm", value_parser = ["vllm", "sglang", "skyrl"], help_heading = "Thunder")]
+    thunder_backend_type: String,
 
     // ==================== Skills ====================
     /// Enable the skills subsystem scaffolding.
@@ -1114,9 +1118,15 @@ impl CliArgs {
                 "tr" => ThunderSubMode::Tr,
                 _ => ThunderSubMode::Default,
             };
+            let backend_type = match self.thunder_backend_type.as_str() {
+                "sglang" => ThunderBackendType::Sglang,
+                "skyrl" => ThunderBackendType::Skyrl,
+                _ => ThunderBackendType::Vllm,
+            };
             RoutingMode::Thunder {
                 worker_urls: self.worker_urls.clone(),
                 sub_mode,
+                backend_type,
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
