@@ -1145,6 +1145,8 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
+    let extra_routes = app_state.router.extra_routes();
+
     Ok(Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
@@ -1153,6 +1155,7 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
+        .merge(extra_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

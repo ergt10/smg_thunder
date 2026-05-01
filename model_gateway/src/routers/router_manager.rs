@@ -13,7 +13,7 @@ use axum::{
     extract::Request,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use dashmap::DashMap;
 use futures::future::select_all;
@@ -875,6 +875,15 @@ impl RouterTrait for RouterManager {
 
     fn router_type(&self) -> &'static str {
         "manager"
+    }
+
+    fn extra_routes(&self) -> Router<Arc<crate::server::AppState>> {
+        let routers_snapshot = self.routers_snapshot.load();
+        routers_snapshot
+            .iter()
+            .fold(Router::new(), |routes, router| {
+                routes.merge(router.extra_routes())
+            })
     }
 }
 

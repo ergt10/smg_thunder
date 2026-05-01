@@ -1,6 +1,6 @@
 //! Router implementations
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -8,6 +8,7 @@ use axum::{
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Router,
 };
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -312,6 +313,11 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Get router type name
     fn router_type(&self) -> &'static str;
+
+    /// Extra HTTP routes exposed by a router implementation.
+    fn extra_routes(&self) -> Router<Arc<crate::server::AppState>> {
+        Router::new()
+    }
 
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {

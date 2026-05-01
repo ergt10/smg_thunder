@@ -6,6 +6,7 @@
 //! Phase 1: empty router that returns 501 for every endpoint, just so the factory plumbing and
 //! CLI flags compile and route end-to-end. Real chat passthrough lands in Phase 3.
 
+mod program;
 mod proxy;
 pub mod router;
 
