@@ -7,6 +7,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Path;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
@@ -22,10 +23,11 @@ use crate::routers::error;
 
 use super::backend::{BackendState, BUFFER_PER_PROGRAM};
 use super::metrics::{MetricsClient, SglangMetricsClient, SkyrlMetricsClient, VllmMetricsClient};
+use super::profile::{ProfileRegistry, ProfileState};
 use super::program::{snapshot_programs, Program, ProgramRegistry};
 use super::proxy::{
     forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback,
-    StreamingProgressCallback,
+    StreamingFirstTokenCallback, StreamingProgressCallback, UsageTokens,
 };
 use super::scheduler::{wait_for_resume_or_force, SchedulerState};
 
@@ -39,6 +41,8 @@ pub struct ThunderRouter {
     backends: Vec<Arc<BackendState>>,
     client: reqwest::Client,
     programs: ProgramRegistry,
+    profiles: ProfileRegistry,
+    profile_enabled: bool,
     sub_mode: ThunderSubMode,
     scheduler: Option<SchedulerState>,
 }
@@ -58,12 +62,13 @@ impl std::fmt::Debug for ThunderRouter {
 
 impl ThunderRouter {
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        let (worker_urls, sub_mode, backend_type) = match &ctx.router_config.mode {
+        let (worker_urls, sub_mode, backend_type, profile_enabled) = match &ctx.router_config.mode {
             crate::config::RoutingMode::Thunder {
                 worker_urls,
                 sub_mode,
                 backend_type,
-            } => (worker_urls.clone(), *sub_mode, *backend_type),
+                profile,
+            } => (worker_urls.clone(), *sub_mode, *backend_type, *profile),
             other => {
                 return Err(format!(
                     "ThunderRouter::new called with non-Thunder mode: {:?}",
@@ -93,6 +98,7 @@ impl ThunderRouter {
         }
 
         let programs = Arc::new(dashmap::DashMap::new());
+        let profiles = Arc::new(dashmap::DashMap::new());
         let scheduler = (sub_mode == ThunderSubMode::Tr).then(|| {
             let scheduler =
                 SchedulerState::new(backends.clone(), Arc::clone(&programs), SCHEDULER_INTERVAL);
@@ -104,6 +110,8 @@ impl ThunderRouter {
             backends,
             client,
             programs,
+            profiles,
+            profile_enabled,
             sub_mode,
             scheduler,
         })
@@ -264,6 +272,44 @@ impl ThunderRouter {
             program.update_streaming_tokens(delta_tokens);
         }
     }
+
+    fn profile_arrive(&self, program_id: &str) {
+        if !self.profile_enabled {
+            return;
+        }
+        let mut profile = self
+            .profiles
+            .entry(program_id.to_owned())
+            .or_insert_with(|| ProfileState::new(program_id));
+        profile.on_request_arrive();
+    }
+
+    fn profile_start(&self, program_id: &str) {
+        if !self.profile_enabled {
+            return;
+        }
+        if let Some(mut profile) = self.profiles.get_mut(program_id) {
+            profile.on_request_start();
+        }
+    }
+
+    fn profile_first_token(profiles: &ProfileRegistry, program_id: &str) {
+        if let Some(mut profile) = profiles.get_mut(program_id) {
+            profile.on_first_token();
+        }
+    }
+
+    fn profile_tokens(profiles: &ProfileRegistry, program_id: &str, delta_tokens: u64) {
+        if let Some(mut profile) = profiles.get_mut(program_id) {
+            profile.on_token(delta_tokens);
+        }
+    }
+
+    fn profile_end(profiles: &ProfileRegistry, program_id: &str, usage: Option<UsageTokens>) {
+        if let Some(mut profile) = profiles.get_mut(program_id) {
+            profile.on_request_end(usage);
+        }
+    }
 }
 
 fn spawn_metrics_poller(metrics: Arc<dyn MetricsClient>) {
@@ -309,6 +355,7 @@ impl crate::routers::RouterTrait for ThunderRouter {
 
     fn extra_routes(&self) -> Router<Arc<crate::server::AppState>> {
         let programs = Arc::clone(&self.programs);
+        let profiles = Arc::clone(&self.profiles);
         let backends = self.backends.clone();
         Router::new()
             .route(
@@ -340,6 +387,70 @@ impl crate::routers::RouterTrait for ThunderRouter {
                     }
                 }),
             )
+            .route(
+                "/profiles",
+                get({
+                    let profiles = Arc::clone(&profiles);
+                    move || {
+                        let profiles = Arc::clone(&profiles);
+                        async move {
+                            let snapshot: std::collections::BTreeMap<_, _> = profiles
+                                .iter()
+                                .map(|entry| {
+                                    let profile = entry.value();
+                                    (
+                                        entry.key().clone(),
+                                        json!({
+                                            "program_id": profile.program_id.clone(),
+                                            "request_arrive_ms": profile.request_arrive_ms,
+                                            "request_start_ms": profile.request_start_ms,
+                                            "first_token_ms": profile.first_token_ms,
+                                            "request_end_ms": profile.request_end_ms,
+                                            "first_token_time_ms": profile.first_token_time_ms(),
+                                            "decode_time_ms": profile.decode_time_ms(),
+                                            "token_count": profile.token_count,
+                                            "prompt_tokens": profile.prompt_tokens,
+                                            "completion_tokens": profile.completion_tokens,
+                                            "cached_tokens": profile.cached_tokens,
+                                        }),
+                                    )
+                                })
+                                .collect();
+                            Json(snapshot)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/profiles/{program_id}",
+                get({
+                    let profiles = Arc::clone(&profiles);
+                    move |Path(program_id): Path<String>| {
+                        let profiles = Arc::clone(&profiles);
+                        async move {
+                            let payload = profiles
+                                .get(&program_id)
+                                .map(|profile| {
+                                    json!({
+                                        "program_id": profile.program_id.clone(),
+                                        "request_arrive_ms": profile.request_arrive_ms,
+                                        "request_start_ms": profile.request_start_ms,
+                                        "first_token_ms": profile.first_token_ms,
+                                        "request_end_ms": profile.request_end_ms,
+                                        "first_token_time_ms": profile.first_token_time_ms(),
+                                        "decode_time_ms": profile.decode_time_ms(),
+                                        "token_count": profile.token_count,
+                                        "prompt_tokens": profile.prompt_tokens,
+                                        "completion_tokens": profile.completion_tokens,
+                                        "cached_tokens": profile.cached_tokens,
+                                    })
+                                })
+                                .unwrap_or(Value::Null);
+                            Json(payload)
+                        }
+                    }
+                }),
+            )
     }
 
     async fn route_chat(
@@ -350,6 +461,7 @@ impl crate::routers::RouterTrait for ThunderRouter {
         _model_id: &str,
     ) -> Response {
         let program_id = program_id_from_request(body);
+        self.profile_arrive(&program_id);
 
         if self.backends.is_empty() {
             return error::service_unavailable(
@@ -369,33 +481,65 @@ impl crate::routers::RouterTrait for ThunderRouter {
         };
 
         let backend_url = backend.url().to_string();
+        self.profile_start(&program_id);
 
         if body.stream {
             let programs = Arc::clone(&self.programs);
+            let finish_profiles = Arc::clone(&self.profiles);
+            let finish_program_id = program_id.clone();
+            let first_token_profiles = Arc::clone(&self.profiles);
+            let first_token_program_id = program_id.clone();
+            let progress_profiles = Arc::clone(&self.profiles);
             let progress_programs = Arc::clone(&self.programs);
             let progress_program_id = program_id.clone();
-            let on_finish: StreamingFinishCallback = Box::new(move |total_tokens| {
-                Self::complete_program(&programs, &program_id, total_tokens);
+            let profile_enabled = self.profile_enabled;
+            let on_finish: StreamingFinishCallback = Box::new(move |usage| {
+                Self::complete_program(
+                    &programs,
+                    &program_id,
+                    usage.and_then(|usage| usage.total_tokens()),
+                );
+                if profile_enabled {
+                    Self::profile_end(&finish_profiles, &finish_program_id, usage);
+                }
             });
+            let on_first_token: Option<StreamingFirstTokenCallback> =
+                self.profile_enabled.then(|| {
+                    Box::new(move || {
+                        Self::profile_first_token(&first_token_profiles, &first_token_program_id);
+                    }) as StreamingFirstTokenCallback
+                });
+            let profile_enabled = self.profile_enabled;
             let on_progress: StreamingProgressCallback = Box::new(move |delta_tokens| {
                 Self::update_streaming_tokens(
                     &progress_programs,
                     &progress_program_id,
                     delta_tokens,
                 );
+                if profile_enabled {
+                    Self::profile_tokens(&progress_profiles, &progress_program_id, delta_tokens);
+                }
             });
             return forward_streaming_chat(
                 &self.client,
                 &backend_url,
                 body,
                 Some(on_finish),
+                on_first_token,
                 Some(on_progress),
             )
             .await;
         }
 
         let forwarded = forward_non_streaming_chat(&self.client, &backend_url, body).await;
-        Self::complete_program(&self.programs, &program_id, forwarded.total_tokens);
+        Self::complete_program(
+            &self.programs,
+            &program_id,
+            forwarded.usage.and_then(|usage| usage.total_tokens()),
+        );
+        if self.profile_enabled {
+            Self::profile_end(&self.profiles, &program_id, forwarded.usage);
+        }
         forwarded.response
     }
 }

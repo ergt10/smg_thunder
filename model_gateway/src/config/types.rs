@@ -295,6 +295,9 @@ pub enum RoutingMode {
         /// Backend metrics dialect used for cache-capacity polling.
         #[serde(default)]
         backend_type: ThunderBackendType,
+        /// Enable `/profiles` timing and token accounting endpoints.
+        #[serde(default)]
+        profile: bool,
     },
 }
 

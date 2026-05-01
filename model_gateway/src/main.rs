@@ -492,6 +492,10 @@ struct CliArgs {
     #[arg(long, default_value = "vllm", value_parser = ["vllm", "sglang", "skyrl"], help_heading = "Thunder")]
     thunder_backend_type: String,
 
+    /// Enable Thunder per-program profiling endpoints.
+    #[arg(long, default_value_t = false, help_heading = "Thunder")]
+    profile: bool,
+
     // ==================== Skills ====================
     /// Enable the skills subsystem scaffolding.
     #[arg(
@@ -1127,6 +1131,7 @@ impl CliArgs {
                 worker_urls: self.worker_urls.clone(),
                 sub_mode,
                 backend_type,
+                profile: self.profile,
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {

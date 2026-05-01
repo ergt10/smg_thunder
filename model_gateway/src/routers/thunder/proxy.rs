@@ -15,20 +15,32 @@ use serde_json::{to_value, Value};
 use crate::routers::common::header_utils;
 use crate::routers::error;
 
-pub(super) type StreamingFinishCallback = Box<dyn FnOnce(Option<u64>) + Send + 'static>;
+pub(super) type StreamingFinishCallback = Box<dyn FnOnce(Option<UsageTokens>) + Send + 'static>;
+pub(super) type StreamingFirstTokenCallback = Box<dyn FnMut() + Send + 'static>;
 pub(super) type StreamingProgressCallback = Box<dyn FnMut(u64) + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct UsageTokens {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+}
+
+impl UsageTokens {
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.total_tokens
+    }
+}
 
 pub(super) struct ForwardedChatResponse {
     pub response: Response,
-    pub total_tokens: Option<u64>,
+    pub usage: Option<UsageTokens>,
 }
 
 impl ForwardedChatResponse {
-    fn new(response: Response, total_tokens: Option<u64>) -> Self {
-        Self {
-            response,
-            total_tokens,
-        }
+    fn new(response: Response, usage: Option<UsageTokens>) -> Self {
+        Self { response, usage }
     }
 }
 
@@ -56,16 +68,26 @@ fn remove_program_id(payload: &mut Value) {
     }
 }
 
-fn extract_total_tokens(payload: &Value) -> Option<u64> {
-    payload
-        .get("usage")
-        .and_then(|usage| usage.get("total_tokens"))
-        .and_then(Value::as_u64)
+fn extract_usage(payload: &Value) -> Option<UsageTokens> {
+    let usage = payload.get("usage")?;
+    Some(UsageTokens {
+        prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
+        completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        cached_tokens: usage
+            .get("cached_tokens")
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+            })
+            .and_then(Value::as_u64),
+    })
 }
 
-fn extract_total_tokens_from_bytes(bytes: &[u8]) -> Option<u64> {
+fn extract_usage_from_bytes(bytes: &[u8]) -> Option<UsageTokens> {
     let payload = serde_json::from_slice::<Value>(bytes).ok()?;
-    extract_total_tokens(&payload)
+    extract_usage(&payload)
 }
 
 type UpstreamByteStream = BoxStream<'static, Result<Bytes, reqwest::Error>>;
@@ -73,9 +95,11 @@ type UpstreamByteStream = BoxStream<'static, Result<Bytes, reqwest::Error>>;
 struct StreamingProgramFinisher {
     inner: UpstreamByteStream,
     sse_buffer: String,
-    total_tokens: Option<u64>,
+    usage: Option<UsageTokens>,
+    first_token_seen: bool,
     pending_progress_tokens: u64,
     on_finish: Option<StreamingFinishCallback>,
+    on_first_token: Option<StreamingFirstTokenCallback>,
     on_progress: Option<StreamingProgressCallback>,
 }
 
@@ -83,14 +107,17 @@ impl StreamingProgramFinisher {
     fn new(
         inner: UpstreamByteStream,
         on_finish: Option<StreamingFinishCallback>,
+        on_first_token: Option<StreamingFirstTokenCallback>,
         on_progress: Option<StreamingProgressCallback>,
     ) -> Self {
         Self {
             inner,
             sse_buffer: String::new(),
-            total_tokens: None,
+            usage: None,
+            first_token_seen: false,
             pending_progress_tokens: 0,
             on_finish,
+            on_first_token,
             on_progress,
         }
     }
@@ -109,8 +136,8 @@ impl StreamingProgramFinisher {
                 continue;
             }
             if let Ok(payload) = serde_json::from_str::<Value>(data) {
-                if let Some(total_tokens) = extract_total_tokens(&payload) {
-                    self.total_tokens = Some(total_tokens);
+                if let Some(usage) = extract_usage(&payload) {
+                    self.usage = Some(usage);
                 }
                 for choice in payload
                     .get("choices")
@@ -132,6 +159,12 @@ impl StreamingProgramFinisher {
     }
 
     fn observe_content_delta(&mut self, content: &str) {
+        if !self.first_token_seen {
+            self.first_token_seen = true;
+            if let Some(on_first_token) = self.on_first_token.as_mut() {
+                on_first_token();
+            }
+        }
         let estimated_tokens = (content.chars().count() as u64).div_ceil(4).max(1);
         self.pending_progress_tokens = self
             .pending_progress_tokens
@@ -145,14 +178,16 @@ impl StreamingProgramFinisher {
     }
 
     fn finish(&mut self) {
-        if self.total_tokens.is_none() && self.pending_progress_tokens > 0 {
+        if self.usage.and_then(|usage| usage.total_tokens).is_none()
+            && self.pending_progress_tokens > 0
+        {
             if let Some(on_progress) = self.on_progress.as_mut() {
                 on_progress(self.pending_progress_tokens);
             }
             self.pending_progress_tokens = 0;
         }
         if let Some(on_finish) = self.on_finish.take() {
-            on_finish(self.total_tokens);
+            on_finish(self.usage);
         }
     }
 }
@@ -217,7 +252,7 @@ pub(super) async fn forward_non_streaming_chat(
             );
         }
     };
-    let total_tokens = extract_total_tokens_from_bytes(&bytes);
+    let usage = extract_usage_from_bytes(&bytes);
 
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
@@ -228,7 +263,7 @@ pub(super) async fn forward_non_streaming_chat(
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
-    ForwardedChatResponse::new(response, total_tokens)
+    ForwardedChatResponse::new(response, usage)
 }
 
 /// Forward a streaming chat-completion request to `worker_url` and relay SSE bytes unchanged.
@@ -240,6 +275,7 @@ pub(super) async fn forward_streaming_chat(
     worker_url: &str,
     body: &ChatCompletionRequest,
     mut on_finish: Option<StreamingFinishCallback>,
+    on_first_token: Option<StreamingFirstTokenCallback>,
     on_progress: Option<StreamingProgressCallback>,
 ) -> Response {
     let url = chat_completions_url(worker_url);
@@ -284,7 +320,8 @@ pub(super) async fn forward_streaming_chat(
         .or_insert(HeaderValue::from_static("text/event-stream"));
 
     let upstream_stream = resp.bytes_stream().boxed();
-    let finisher = StreamingProgramFinisher::new(upstream_stream, on_finish, on_progress);
+    let finisher =
+        StreamingProgramFinisher::new(upstream_stream, on_finish, on_first_token, on_progress);
     let stream = stream::unfold(finisher, |mut finisher| async move {
         match finisher.inner.next().await {
             Some(Ok(bytes)) => {

@@ -5,6 +5,7 @@
 
 mod backend;
 mod metrics;
+mod profile;
 mod program;
 mod proxy;
 pub mod router;
