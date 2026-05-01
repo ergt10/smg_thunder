@@ -14,6 +14,7 @@ use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use openai_protocol::chat::ChatCompletionRequest;
+use parking_lot::RwLock;
 use serde_json::{json, Value};
 
 use crate::app_context::AppContext;
@@ -36,6 +37,7 @@ use super::scheduler::{wait_for_resume_or_force, SchedulerState};
 const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const SCHEDULER_INTERVAL: Duration = Duration::from_millis(500);
 const FORCE_RESUME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_CHAR_TO_TOKEN_RATIO: f64 = 4.0;
 
 pub struct ThunderRouter {
     backends: Vec<Arc<BackendState>>,
@@ -43,6 +45,7 @@ pub struct ThunderRouter {
     programs: ProgramRegistry,
     profiles: ProfileRegistry,
     profile_enabled: bool,
+    char_to_token_ratio: Arc<RwLock<f64>>,
     sub_mode: ThunderSubMode,
     scheduler: Option<SchedulerState>,
 }
@@ -62,13 +65,29 @@ impl std::fmt::Debug for ThunderRouter {
 
 impl ThunderRouter {
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        let (worker_urls, sub_mode, backend_type, profile_enabled) = match &ctx.router_config.mode {
+        let (
+            worker_urls,
+            sub_mode,
+            backend_type,
+            profile_enabled,
+            acting_token_weight,
+            use_acting_token_decay,
+        ) = match &ctx.router_config.mode {
             crate::config::RoutingMode::Thunder {
                 worker_urls,
                 sub_mode,
                 backend_type,
                 profile,
-            } => (worker_urls.clone(), *sub_mode, *backend_type, *profile),
+                acting_token_weight,
+                use_acting_token_decay,
+            } => (
+                worker_urls.clone(),
+                *sub_mode,
+                *backend_type,
+                *profile,
+                *acting_token_weight,
+                *use_acting_token_decay,
+            ),
             other => {
                 return Err(format!(
                     "ThunderRouter::new called with non-Thunder mode: {:?}",
@@ -92,13 +111,19 @@ impl ThunderRouter {
                 }
             };
             let _ = metrics.fetch_cache_config().await;
-            let backend = Arc::new(BackendState::new(url.clone(), metrics.clone()));
+            let backend = Arc::new(BackendState::with_options(
+                url.clone(),
+                metrics.clone(),
+                acting_token_weight,
+                use_acting_token_decay,
+            ));
             spawn_metrics_poller(metrics);
             backends.push(backend);
         }
 
         let programs = Arc::new(dashmap::DashMap::new());
         let profiles = Arc::new(dashmap::DashMap::new());
+        let char_to_token_ratio = Arc::new(RwLock::new(DEFAULT_CHAR_TO_TOKEN_RATIO));
         let scheduler = (sub_mode == ThunderSubMode::Tr).then(|| {
             let scheduler =
                 SchedulerState::new(backends.clone(), Arc::clone(&programs), SCHEDULER_INTERVAL);
@@ -112,6 +137,7 @@ impl ThunderRouter {
             programs,
             profiles,
             profile_enabled,
+            char_to_token_ratio,
             sub_mode,
             scheduler,
         })
@@ -125,7 +151,7 @@ impl ThunderRouter {
     /// new program (at least `BUFFER_PER_PROGRAM` remaining tokens after accounting for existing
     /// programs). Mirrors Python's `_select_backend_for_new_program` with `estimated_tokens = 0`
     /// (char/token ratio and pre-admission token estimation land in Phase 12).
-    fn select_backend_for_new_program(&self) -> Option<Arc<BackendState>> {
+    fn select_backend_for_new_program(&self, estimated_tokens: u64) -> Option<Arc<BackendState>> {
         let mut best: Option<Arc<BackendState>> = None;
         let mut min_active: i64 = i64::MAX;
 
@@ -140,7 +166,8 @@ impl ThunderRouter {
                     continue;
                 }
             };
-            if remaining < BUFFER_PER_PROGRAM as i64 {
+            let required = estimated_tokens.saturating_add(BUFFER_PER_PROGRAM) as i64;
+            if remaining < required {
                 continue; // Not enough headroom for this program's decode buffer
             }
             let active = backend.active_program_tokens(&self.programs) as i64;
@@ -204,7 +231,9 @@ impl ThunderRouter {
             return self.backend_for_program(program_id);
         }
 
-        if let Some(backend) = self.select_backend_for_new_program() {
+        let estimated_tokens = self.estimated_tokens(body);
+
+        if let Some(backend) = self.select_backend_for_new_program(estimated_tokens) {
             self.prepare_program(program_id, body, backend.url());
             return Some(backend);
         }
@@ -234,17 +263,19 @@ impl ThunderRouter {
 
     fn prepare_program(&self, program_id: &str, body: &ChatCompletionRequest, backend_url: &str) {
         let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        let estimated_tokens = self.estimated_tokens_from_context_len(context_len);
         let mut program = self
             .programs
             .entry(program_id.to_owned())
             .or_insert_with(|| Program::new(program_id));
-        program.before_request(context_len, backend_url);
+        program.before_request(context_len, backend_url, estimated_tokens);
     }
 
     fn mark_waiting_request(&self, program_id: &str, body: &ChatCompletionRequest) {
         let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        let estimated_tokens = self.estimated_tokens_from_context_len(context_len);
         if let Some(mut program) = self.programs.get_mut(program_id) {
-            program.before_waiting_request(context_len);
+            program.before_waiting_request(context_len, estimated_tokens);
         }
     }
 
@@ -254,8 +285,9 @@ impl ThunderRouter {
         body: &ChatCompletionRequest,
     ) -> Arc<tokio::sync::Notify> {
         let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        let estimated_tokens = self.estimated_tokens_from_context_len(context_len);
         let mut program = Program::new(program_id);
-        program.before_waiting_request(context_len);
+        program.before_waiting_request(context_len, estimated_tokens);
         let notify = program.pause(None);
         self.programs.insert(program_id.to_owned(), program);
         notify
@@ -310,6 +342,36 @@ impl ThunderRouter {
             profile.on_request_end(usage);
         }
     }
+
+    fn estimated_tokens(&self, body: &ChatCompletionRequest) -> u64 {
+        let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        self.estimated_tokens_from_context_len(context_len)
+    }
+
+    fn estimated_tokens_from_context_len(&self, context_len: usize) -> u64 {
+        let ratio = (*self.char_to_token_ratio.read()).max(1.0);
+        ((context_len as f64) / ratio).ceil().max(1.0) as u64
+    }
+
+    fn update_char_to_token_ratio_from(
+        programs: &ProgramRegistry,
+        char_to_token_ratio: &Arc<RwLock<f64>>,
+        program_id: &str,
+        usage: Option<UsageTokens>,
+    ) {
+        let Some(prompt_tokens) = usage.and_then(|usage| usage.prompt_tokens) else {
+            return;
+        };
+        if prompt_tokens == 0 {
+            return;
+        }
+        let Some(program) = programs.get(program_id) else {
+            return;
+        };
+        let observed = program.context_len as f64 / prompt_tokens as f64;
+        let mut ratio = char_to_token_ratio.write();
+        *ratio = 0.8 * *ratio + 0.2 * observed.max(1.0);
+    }
 }
 
 fn spawn_metrics_poller(metrics: Arc<dyn MetricsClient>) {
@@ -356,6 +418,7 @@ impl crate::routers::RouterTrait for ThunderRouter {
     fn extra_routes(&self) -> Router<Arc<crate::server::AppState>> {
         let programs = Arc::clone(&self.programs);
         let profiles = Arc::clone(&self.profiles);
+        let char_to_token_ratio = Arc::clone(&self.char_to_token_ratio);
         let backends = self.backends.clone();
         Router::new()
             .route(
@@ -376,11 +439,13 @@ impl crate::routers::RouterTrait for ThunderRouter {
                     move || {
                         let programs = Arc::clone(&programs);
                         let backends = backends.clone();
+                        let char_to_token_ratio = Arc::clone(&char_to_token_ratio);
                         async move {
                             let snapshot: Vec<_> =
                                 backends.iter().map(|b| b.snapshot(&programs)).collect();
                             Json(json!({
                                 "program_count": programs.len(),
+                                "char_to_token_ratio": *char_to_token_ratio.read(),
                                 "backends": snapshot,
                             }))
                         }
@@ -485,8 +550,11 @@ impl crate::routers::RouterTrait for ThunderRouter {
 
         if body.stream {
             let programs = Arc::clone(&self.programs);
+            let ratio_programs = Arc::clone(&self.programs);
+            let ratio_state = Arc::clone(&self.char_to_token_ratio);
             let finish_profiles = Arc::clone(&self.profiles);
             let finish_program_id = program_id.clone();
+            let ratio_program_id = program_id.clone();
             let first_token_profiles = Arc::clone(&self.profiles);
             let first_token_program_id = program_id.clone();
             let progress_profiles = Arc::clone(&self.profiles);
@@ -498,6 +566,12 @@ impl crate::routers::RouterTrait for ThunderRouter {
                     &programs,
                     &program_id,
                     usage.and_then(|usage| usage.total_tokens()),
+                );
+                Self::update_char_to_token_ratio_from(
+                    &ratio_programs,
+                    &ratio_state,
+                    &ratio_program_id,
+                    usage,
                 );
                 if profile_enabled {
                     Self::profile_end(&finish_profiles, &finish_program_id, usage);
@@ -536,6 +610,12 @@ impl crate::routers::RouterTrait for ThunderRouter {
             &self.programs,
             &program_id,
             forwarded.usage.and_then(|usage| usage.total_tokens()),
+        );
+        Self::update_char_to_token_ratio_from(
+            &self.programs,
+            &self.char_to_token_ratio,
+            &program_id,
+            forwarded.usage,
         );
         if self.profile_enabled {
             Self::profile_end(&self.profiles, &program_id, forwarded.usage);

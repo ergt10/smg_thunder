@@ -496,6 +496,14 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Thunder")]
     profile: bool,
 
+    /// Weight applied to Thunder ACTING program tokens.
+    #[arg(long, default_value_t = 1.0, help_heading = "Thunder")]
+    acting_token_weight: f64,
+
+    /// Enable Thunder ACTING-token exponential decay.
+    #[arg(long, default_value_t = false, help_heading = "Thunder")]
+    use_acting_token_decay: bool,
+
     // ==================== Skills ====================
     /// Enable the skills subsystem scaffolding.
     #[arg(
@@ -1132,6 +1140,8 @@ impl CliArgs {
                 sub_mode,
                 backend_type,
                 profile: self.profile,
+                acting_token_weight: self.acting_token_weight,
+                use_acting_token_decay: self.use_acting_token_decay,
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {

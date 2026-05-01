@@ -298,7 +298,17 @@ pub enum RoutingMode {
         /// Enable `/profiles` timing and token accounting endpoints.
         #[serde(default)]
         profile: bool,
+        /// Weight applied to ACTING program tokens in capacity pressure.
+        #[serde(default = "default_acting_token_weight")]
+        acting_token_weight: f64,
+        /// Apply 2^-t decay to ACTING program tokens.
+        #[serde(default)]
+        use_acting_token_decay: bool,
     },
+}
+
+pub fn default_acting_token_weight() -> f64 {
+    1.0
 }
 
 /// Scheduling sub-mode for `RoutingMode::Thunder`.

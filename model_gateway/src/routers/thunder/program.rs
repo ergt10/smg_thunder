@@ -43,6 +43,8 @@ pub struct Program {
     pub marked_for_pause: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_at_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acting_since_ms: Option<u128>,
 }
 
 impl Program {
@@ -59,23 +61,28 @@ impl Program {
             waiting_notify: None,
             marked_for_pause: false,
             paused_at_ms: None,
+            acting_since_ms: None,
         }
     }
 
-    pub fn before_request(&mut self, context_len: usize, backend_url: &str) {
+    pub fn before_request(&mut self, context_len: usize, backend_url: &str, estimated_tokens: u64) {
         self.step_count += 1;
         self.context_len = context_len;
+        self.total_tokens = self.total_tokens.max(estimated_tokens);
         self.status = ProgramStatus::Reasoning;
         self.state = ProgramState::Active;
+        self.acting_since_ms = None;
         if self.backend_url.is_none() {
             self.backend_url = Some(backend_url.to_owned());
         }
     }
 
-    pub fn before_waiting_request(&mut self, context_len: usize) {
+    pub fn before_waiting_request(&mut self, context_len: usize, estimated_tokens: u64) {
         self.step_count += 1;
         self.context_len = context_len;
+        self.total_tokens = self.total_tokens.max(estimated_tokens);
         self.status = ProgramStatus::Reasoning;
+        self.acting_since_ms = None;
     }
 
     pub fn pause(&mut self, origin_backend: Option<String>) -> Arc<Notify> {
@@ -104,6 +111,7 @@ impl Program {
             self.total_tokens = total_tokens;
         }
         self.status = ProgramStatus::Acting;
+        self.acting_since_ms = now_ms();
     }
 
     pub fn update_streaming_tokens(&mut self, delta_tokens: u64) {
@@ -125,6 +133,8 @@ pub struct ProgramSnapshot {
     pub marked_for_pause: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_at_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acting_since_ms: Option<u128>,
 }
 
 impl From<&Program> for ProgramSnapshot {
@@ -139,6 +149,7 @@ impl From<&Program> for ProgramSnapshot {
             origin_backend: program.origin_backend.clone(),
             marked_for_pause: program.marked_for_pause,
             paused_at_ms: program.paused_at_ms,
+            acting_since_ms: program.acting_since_ms,
         }
     }
 }
@@ -148,4 +159,11 @@ pub fn snapshot_programs(programs: &ProgramRegistry) -> BTreeMap<String, Program
         .iter()
         .map(|entry| (entry.key().clone(), ProgramSnapshot::from(entry.value())))
         .collect()
+}
+
+fn now_ms() -> Option<u128> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis())
 }

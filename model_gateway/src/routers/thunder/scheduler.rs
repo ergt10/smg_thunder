@@ -107,7 +107,7 @@ impl SchedulerState {
             .filter(|backend| backend.healthy())
             .filter_map(|backend| {
                 backend
-                    .remaining_capacity(&self.programs)
+                    .remaining_capacity_with_decay(&self.programs)
                     .filter(|remaining| *remaining >= BUFFER_PER_PROGRAM as i64)
                     .map(|remaining| (Arc::clone(backend), remaining))
             })
