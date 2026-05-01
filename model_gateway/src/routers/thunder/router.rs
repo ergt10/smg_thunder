@@ -1,11 +1,7 @@
-//! `ThunderRouter` — program-aware proxy. Phase 7: TR sub-mode capacity admission.
+//! `ThunderRouter` — program-aware proxy. Phase 8: TR pause/resume scheduling.
 //!
-//! Phase 6 tracked per-backend capacity via `BackendState` + `VllmMetricsClient`. Phase 7 adds
-//! a `--thunder-sub-mode tr` flag that enforces capacity admission on *new* programs:
-//! if no backend has room, the request gets a 503 (pause/resume replaces that in Phase 8).
-//!
-//! Existing programs (already pinned to a backend) are never blocked — they continue on their
-//! assigned backend regardless of the remaining_capacity snapshot (matches Python's behaviour).
+//! Default mode remains a transparent proxy. TR mode queues new programs when capacity is full,
+//! then a periodic scheduler resumes them when backend capacity becomes available.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -28,16 +24,20 @@ use super::backend::{BackendState, BUFFER_PER_PROGRAM};
 use super::metrics::{MetricsClient, VllmMetricsClient};
 use super::program::{snapshot_programs, Program, ProgramRegistry};
 use super::proxy::{forward_non_streaming_chat, forward_streaming_chat, StreamingFinishCallback};
+use super::scheduler::{wait_for_resume_or_force, SchedulerState};
 
 /// Interval for the per-backend metrics polling loop. Kept tight enough for e2e tests to observe
 /// dynamic capacity changes within a few seconds.
 const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+const SCHEDULER_INTERVAL: Duration = Duration::from_millis(500);
+const FORCE_RESUME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub struct ThunderRouter {
     backends: Vec<Arc<BackendState>>,
     client: reqwest::Client,
     programs: ProgramRegistry,
     sub_mode: ThunderSubMode,
+    scheduler: Option<SchedulerState>,
 }
 
 impl std::fmt::Debug for ThunderRouter {
@@ -78,44 +78,25 @@ impl ThunderRouter {
             backends.push(backend);
         }
 
+        let programs = Arc::new(dashmap::DashMap::new());
+        let scheduler = (sub_mode == ThunderSubMode::Tr).then(|| {
+            let scheduler =
+                SchedulerState::new(backends.clone(), Arc::clone(&programs), SCHEDULER_INTERVAL);
+            scheduler.spawn();
+            scheduler
+        });
+
         Ok(Self {
             backends,
             client,
-            programs: Arc::new(dashmap::DashMap::new()),
+            programs,
             sub_mode,
+            scheduler,
         })
     }
 
     pub fn worker_urls(&self) -> Vec<String> {
         self.backends.iter().map(|b| b.url().to_string()).collect()
-    }
-
-    /// Resolve the backend for this request according to the current sub-mode.
-    ///
-    /// - `Default`: always returns the first configured backend (Phase 6 behaviour).
-    /// - `Tr` + existing program: returns the program's pinned backend (or first as fallback).
-    /// - `Tr` + new program: runs capacity admission — returns `None` when no backend has room.
-    fn resolve_backend(&self, program_id: &str) -> Option<Arc<BackendState>> {
-        match self.sub_mode {
-            ThunderSubMode::Default => self.backends.first().cloned(),
-            ThunderSubMode::Tr => {
-                if self.programs.contains_key(program_id) {
-                    // Existing program: honour its pinned backend. Fall back to first on stale URL.
-                    let backend_url: Option<String> = self
-                        .programs
-                        .get(program_id)
-                        .and_then(|p| p.backend_url.clone());
-                    if let Some(url) = backend_url {
-                        if let Some(b) = self.backends.iter().find(|b| b.url() == url) {
-                            return Some(Arc::clone(b));
-                        }
-                    }
-                    self.backends.first().cloned()
-                } else {
-                    self.select_backend_for_new_program()
-                }
-            }
-        }
     }
 
     /// TR-mode admission: pick the least-loaded backend that still has enough capacity for one
@@ -149,6 +130,86 @@ impl ThunderRouter {
         best
     }
 
+    async fn admit_program(
+        &self,
+        program_id: &str,
+        body: &ChatCompletionRequest,
+    ) -> Option<Arc<BackendState>> {
+        match self.sub_mode {
+            ThunderSubMode::Default => {
+                let backend = self.backends.first().cloned()?;
+                self.prepare_program(program_id, body, backend.url());
+                Some(backend)
+            }
+            ThunderSubMode::Tr => self.admit_program_tr(program_id, body).await,
+        }
+    }
+
+    async fn admit_program_tr(
+        &self,
+        program_id: &str,
+        body: &ChatCompletionRequest,
+    ) -> Option<Arc<BackendState>> {
+        if let Some(url) = self
+            .programs
+            .get(program_id)
+            .and_then(|program| program.backend_url.clone())
+        {
+            let backend = self
+                .backends
+                .iter()
+                .find(|backend| backend.url() == url)
+                .cloned()
+                .or_else(|| self.backends.first().cloned())?;
+            self.prepare_program(program_id, body, backend.url());
+            return Some(backend);
+        }
+
+        if let Some(notify) = self
+            .programs
+            .get(program_id)
+            .and_then(|program| program.waiting_notify.clone())
+        {
+            self.mark_waiting_request(program_id, body);
+            let scheduler = self.scheduler.clone()?;
+            wait_for_resume_or_force(
+                notify,
+                scheduler,
+                program_id.to_string(),
+                FORCE_RESUME_TIMEOUT,
+            )
+            .await;
+            return self.backend_for_program(program_id);
+        }
+
+        if let Some(backend) = self.select_backend_for_new_program() {
+            self.prepare_program(program_id, body, backend.url());
+            return Some(backend);
+        }
+
+        let notify = self.pause_new_program(program_id, body);
+        let scheduler = self.scheduler.clone()?;
+        wait_for_resume_or_force(
+            notify,
+            scheduler,
+            program_id.to_string(),
+            FORCE_RESUME_TIMEOUT,
+        )
+        .await;
+        self.backend_for_program(program_id)
+    }
+
+    fn backend_for_program(&self, program_id: &str) -> Option<Arc<BackendState>> {
+        let url = self
+            .programs
+            .get(program_id)
+            .and_then(|program| program.backend_url.clone())?;
+        self.backends
+            .iter()
+            .find(|backend| backend.url() == url)
+            .cloned()
+    }
+
     fn prepare_program(&self, program_id: &str, body: &ChatCompletionRequest, backend_url: &str) {
         let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
         let mut program = self
@@ -156,6 +217,26 @@ impl ThunderRouter {
             .entry(program_id.to_owned())
             .or_insert_with(|| Program::new(program_id));
         program.before_request(context_len, backend_url);
+    }
+
+    fn mark_waiting_request(&self, program_id: &str, body: &ChatCompletionRequest) {
+        let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        if let Some(mut program) = self.programs.get_mut(program_id) {
+            program.before_waiting_request(context_len);
+        }
+    }
+
+    fn pause_new_program(
+        &self,
+        program_id: &str,
+        body: &ChatCompletionRequest,
+    ) -> Arc<tokio::sync::Notify> {
+        let context_len = serde_json::to_vec(body).map_or(0, |bytes| bytes.len());
+        let mut program = Program::new(program_id);
+        program.before_waiting_request(context_len);
+        let notify = program.pause(None);
+        self.programs.insert(program_id.to_owned(), program);
+        notify
     }
 
     fn complete_program(programs: &ProgramRegistry, program_id: &str, total_tokens: Option<u64>) {
@@ -257,27 +338,24 @@ impl crate::routers::RouterTrait for ThunderRouter {
             );
         }
 
-        let backend = match self.resolve_backend(&program_id) {
+        let backend = match self.admit_program(&program_id, body).await {
             Some(b) => b,
             None => {
                 return error::service_unavailable(
-                    "capacity_full",
-                    "Thunder TR mode: all backends are at capacity; retry later (pause/resume arrives in Phase 8)",
+                    "no_workers",
+                    "Thunder mode has no worker URLs configured",
                 )
             }
         };
 
-
         let backend_url = backend.url().to_string();
-        self.prepare_program(&program_id, body, &backend_url);
 
         if body.stream {
             let programs = Arc::clone(&self.programs);
             let on_finish: StreamingFinishCallback = Box::new(move |total_tokens| {
                 Self::complete_program(&programs, &program_id, total_tokens);
             });
-            return forward_streaming_chat(&self.client, &backend_url, body, Some(on_finish))
-                .await;
+            return forward_streaming_chat(&self.client, &backend_url, body, Some(on_finish)).await;
         }
 
         let forwarded = forward_non_streaming_chat(&self.client, &backend_url, body).await;

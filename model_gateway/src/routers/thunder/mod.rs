@@ -8,5 +8,6 @@ mod metrics;
 mod program;
 mod proxy;
 pub mod router;
+mod scheduler;
 
 pub use router::ThunderRouter;
