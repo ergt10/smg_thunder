@@ -285,9 +285,29 @@ pub enum RoutingMode {
     #[serde(rename = "gemini")]
     Gemini { worker_urls: Vec<String> },
     /// Thunder mode — program-aware proxy with capacity-based pause/resume scheduling.
-    /// Phase 1 stub: just holds worker URLs; sub-mode and backend type flags arrive in later phases.
     #[serde(rename = "thunder")]
-    Thunder { worker_urls: Vec<String> },
+    Thunder {
+        worker_urls: Vec<String>,
+        /// `default` = pure proxy (no capacity gates); `tr` = capacity-aware admission with
+        /// pause/resume scheduling.  Defaults to `default` for backwards-compat config files.
+        #[serde(default)]
+        sub_mode: ThunderSubMode,
+    },
+}
+
+/// Scheduling sub-mode for `RoutingMode::Thunder`.
+///
+/// - `Default`: pure transparent proxy — no capacity admission gates. Matches Python's
+///   `scheduling_enabled=False`.
+/// - `Tr`: capacity-based admission — new programs are only forwarded when a backend has
+///   sufficient remaining KV-cache capacity. If none does, Phase 7 returns 503; Phase 8
+///   replaces that with a `tokio::sync::Notify`-based pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThunderSubMode {
+    #[default]
+    Default,
+    Tr,
 }
 
 impl RoutingMode {
@@ -306,7 +326,7 @@ impl RoutingMode {
             RoutingMode::OpenAI { worker_urls } => worker_urls.len(),
             RoutingMode::Anthropic { worker_urls } => worker_urls.len(),
             RoutingMode::Gemini { worker_urls } => worker_urls.len(),
-            RoutingMode::Thunder { worker_urls } => worker_urls.len(),
+            RoutingMode::Thunder { worker_urls, .. } => worker_urls.len(),
         }
     }
 

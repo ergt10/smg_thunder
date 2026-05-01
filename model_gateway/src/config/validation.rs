@@ -349,7 +349,7 @@ impl ConfigValidator {
                     Self::validate_urls(worker_urls)?;
                 }
             }
-            RoutingMode::Thunder { worker_urls } => {
+            RoutingMode::Thunder { worker_urls, .. } => {
                 // Same lenient policy as OpenAI/Anthropic/Gemini — URLs validated when present.
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;

@@ -7,7 +7,7 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
         PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        TokenizerCacheConfig, TraceConfig,
+        ThunderSubMode, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -478,6 +478,15 @@ struct CliArgs {
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
+
+    // ==================== Thunder ====================
+    /// Scheduling sub-mode for --backend thunder.
+    /// `default` = pure proxy (no capacity gates, identical to Phase 1-6 behavior).
+    /// `tr` = capacity-aware admission: new programs are only forwarded when a backend has
+    /// sufficient remaining KV-cache capacity; if none does, the request gets a 503 until
+    /// Phase 8 introduces pause/resume.
+    #[arg(long, default_value = "default", value_parser = ["default", "tr"], help_heading = "Thunder")]
+    thunder_sub_mode: String,
 
     // ==================== Skills ====================
     /// Enable the skills subsystem scaffolding.
@@ -1101,8 +1110,13 @@ impl CliArgs {
                 worker_urls: self.worker_urls.clone(),
             }
         } else if matches!(self.backend, Some(Backend::Thunder)) {
+            let sub_mode = match self.thunder_sub_mode.as_str() {
+                "tr" => ThunderSubMode::Tr,
+                _ => ThunderSubMode::Default,
+            };
             RoutingMode::Thunder {
                 worker_urls: self.worker_urls.clone(),
+                sub_mode,
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -1171,7 +1185,7 @@ impl CliArgs {
             RoutingMode::Gemini { worker_urls } => {
                 all_urls.extend(worker_urls.clone());
             }
-            RoutingMode::Thunder { worker_urls } => {
+            RoutingMode::Thunder { worker_urls, .. } => {
                 all_urls.extend(worker_urls.clone());
             }
         }
